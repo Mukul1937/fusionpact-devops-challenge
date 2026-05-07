@@ -1,0 +1,169 @@
+﻿# ============================================================
+# Prometheus Alert Rules
+# Fusionpact Production Alerting
+# ============================================================
+
+groups:
+
+  # �� Infrastructure Alerts ���������������������������������
+  - name: infrastructure_alerts
+    interval: 30s
+    rules:
+
+      # High CPU Usage Alert
+      - alert: HighCPUUsage
+        expr: |
+          100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "High CPU usage on {{ $labels.instance }}"
+          description: |
+            CPU usage is above 80% on {{ $labels.instance }}
+            Current value: {{ $value | printf "%.2f" }}%
+          runbook: "https://wiki.fusionpact.io/runbooks/high-cpu"
+
+      # Critical CPU Usage Alert
+      - alert: CriticalCPUUsage
+        expr: |
+          100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 95
+        for: 2m
+        labels:
+          severity: critical
+          team: devops
+        annotations:
+          summary: "CRITICAL: CPU usage extremely high on {{ $labels.instance }}"
+          description: "CPU usage is above 95%. Immediate action required!"
+
+      # High Memory Usage Alert
+      - alert: HighMemoryUsage
+        expr: |
+          (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "High memory usage on {{ $labels.instance }}"
+          description: |
+            Memory usage is above 85%
+            Current value: {{ $value | printf "%.2f" }}%
+
+      # Critical Memory Usage Alert
+      - alert: CriticalMemoryUsage
+        expr: |
+          (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 95
+        for: 2m
+        labels:
+          severity: critical
+          team: devops
+        annotations:
+          summary: "CRITICAL: Memory nearly exhausted on {{ $labels.instance }}"
+          description: "Memory usage is above 95%. OOM risk!"
+
+      # Low Disk Space Alert
+      - alert: LowDiskSpace
+        expr: |
+          (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 20
+        for: 5m
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "Low disk space on {{ $labels.instance }}"
+          description: "Disk space below 20% on {{ $labels.mountpoint }}"
+
+      # Critical Disk Space Alert
+      - alert: CriticalDiskSpace
+        expr: |
+          (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 10
+        for: 2m
+        labels:
+          severity: critical
+          team: devops
+        annotations:
+          summary: "CRITICAL: Disk space critically low on {{ $labels.instance }}"
+          description: "Disk space below 10%! Risk of service disruption!"
+
+  # �� Application Alerts ������������������������������������
+  - name: application_alerts
+    interval: 15s
+    rules:
+
+      # Backend Service Down
+      - alert: BackendServiceDown
+        expr: up{job="fusionpact-backend"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: devops
+          service: backend
+        annotations:
+          summary: "Backend service is DOWN"
+          description: "The FastAPI backend service has been unreachable for 1 minute!"
+
+      # High Error Rate
+      - alert: HighErrorRate
+        expr: |
+          rate(http_requests_total{status=~"5.."}[5m]) 
+          / rate(http_requests_total[5m]) * 100 > 5
+        for: 5m
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "High HTTP error rate detected"
+          description: "HTTP 5xx error rate is {{ $value | printf \"%.2f\" }}% (threshold: 5%)"
+
+      # High API Latency
+      - alert: HighAPILatency
+        expr: |
+          histogram_quantile(0.95, 
+            rate(http_request_duration_seconds_bucket[5m])
+          ) > 2
+        for: 5m
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "High API response latency"
+          description: "95th percentile latency is {{ $value | printf \"%.2f\" }}s (threshold: 2s)"
+
+  # �� Container Alerts ��������������������������������������
+  - name: container_alerts
+    interval: 30s
+    rules:
+
+      # Container Restart Alert
+      - alert: ContainerRestarting
+        expr: |
+          rate(container_last_seen{
+            container_label_com_fusionpact_service!=""
+          }[5m]) > 0
+          and 
+          increase(container_start_time_seconds{
+            container_label_com_fusionpact_service!=""
+          }[30m]) > 2
+        for: 5m
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "Container {{ $labels.name }} is restarting frequently"
+          description: "Container has restarted more than 2 times in 30 minutes"
+
+      # High Container CPU
+      - alert: ContainerHighCPU
+        expr: |
+          rate(container_cpu_usage_seconds_total{
+            container_label_com_fusionpact_service!=""
+          }[5m]) * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "High CPU in container {{ $labels.name }}"
+          description: "Container CPU usage is {{ $value | printf \"%.2f\" }}%"

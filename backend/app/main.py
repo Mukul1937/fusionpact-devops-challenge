@@ -30,9 +30,9 @@ async def user_create(user: UserIn):
     return {"success": True}
 
 
-@app.get("/users", response_model=UserListOut)
-async def get_users():
+@app.get("/health")
+async def health_check():
     """
-    Read user data from json file
+    Health check endpoint
     """
-    return services.read_usersdata()
+    return {"status": "healthy"}

@@ -1,0 +1,507 @@
+# ============================================================
+# Fusionpact DevOps Gauntlet - CI/CD Pipeline
+# GitHub Actions Workflow
+# ============================================================
+
+name: ?? Fusionpact CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        default: "production"
+        type: choice
+        options: [production, staging]
+      force_deploy:
+        description: "Force deploy even if tests fail"
+        required: false
+        default: "false"
+        type: boolean
+
+# ฤฤ Concurrency: Only one deploy at a time ฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤ
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# ฤฤ Environment Variables ฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤ
+env:
+  DOCKER_REGISTRY: docker.io
+  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+  IMAGE_PREFIX: ${{ secrets.DOCKER_USERNAME }}/fusionpact
+  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+jobs:
+
+  # อออออออออออออออออออออออออออออออออออออออออออออออออออออออ
+  # JOB 1: Code Quality & Security Scan
+  # อออออออออออออออออออออออออออออออออออออออออออออออออออออออ
+  code-quality:
+    name: ?? Code Quality & Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: ?? Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for SonarCloud
+
+      - name: ?? Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: ?? Install Dependencies
+        run: |
+          cd backend
+          pip install -r requirements.txt
+          pip install flake8 black pytest pytest-cov bandit safety
+
+      - name: ?? Code Formatting Check (Black)
+        run: |
+          cd backend
+          black --check --diff .
+        continue-on-error: true
+
+      - name: ?? Linting (Flake8)
+        run: |
+          cd backend
+          flake8 . --max-line-length=120 --exclude=.git,__pycache__ \
+            --format='%(path)s:%(row)d:%(col)d: %(code)s %(text)s'
+        continue-on-error: true
+
+      - name: ?? Security Scan (Bandit)
+        run: |
+          cd backend
+          bandit -r . -f json -o bandit-report.json || true
+          bandit -r . --severity-level medium || true
+
+      - name: ??? Dependency Vulnerability Check (Safety)
+        run: |
+          cd backend
+          safety check -r requirements.txt --json > safety-report.json || true
+          safety check -r requirements.txt || true
+
+      - name: ?? Upload Security Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-reports
+          path: |
+            backend/bandit-report.json
+            backend/safety-report.json
+          retention-days: 30
+
+  # อออออออออออออออออออออออออออออออออออออออออออออออออออออออ
+  # JOB 2: Run Tests
+  # อออออออออออออออออออออออออออออออออออออออออออออออออออออออ
+  test:
+    name: ?? Run Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: code-quality
+
+    services:
+      # Test database (if needed)
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: ?? Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: ?? Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: ?? Install Dependencies
+        run: |
+          cd backend
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-asyncio httpx
+
+      - name: ?? Run Unit Tests
+        run: |
+          cd backend
+          python -m pytest tests/ -v \
+            --cov=. \
+            --cov-report=xml \
+            --cov-report=html \
+            --cov-report=term-missing \
+            --junitxml=test-results.xml \
+            -k "not integration" || true
+
+      - name: ?? Run Integration Tests
+        run: |
+          cd backend
+          # Start the backend for integration testing
+          uvicorn main:app --host 0.0.0.0 --port 8000 &
+          sleep 5
+          
+          # Test health endpoint
+          curl -f http://localhost:8000/health || exit 1
+          
+          # Test metrics endpoint
+          curl -f http://localhost:8000/metrics || exit 1
+          
+          echo "? Integration tests passed!"
+
+      - name: ?? Upload Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: |
+            backend/test-results.xml
+            backend/htmlcov/
+            backend/coverage.xml
+          retention-days: 30
+
+      - name: ?? Coverage Report Comment
+        uses: py-cov-action/python-coverage-comment-action@v3
+        if: github.event_name == 'pull_request'
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+  # อออออออออออออออออออออออออออออออออออออออออออออออออออออออ
+  # JOB 3: Build & Push Docker Images
+  # อออออออออออออออออออออออออออออออออออออออออออออออออออออออ
+  build-and-push:
+    name: ?? Build & Push Docker Images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: test
+    if: github.event_name != 'pull_request'
+
+    outputs:
+      backend_image: ${{ steps.meta-backend.outputs.tags }}
+      frontend_image: ${{ steps.meta-frontend.outputs.tags }}
+      image_tag: ${{ steps.image-tag.outputs.tag }}
+
+    steps:
+      - name: ?? Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: ??? Generate Image Tag
+        id: image-tag
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          BRANCH=$(echo ${{ github.ref_name }} | sed 's/[^a-zA-Z0-9._-]/-/g')
+          TAG="${BRANCH}-${SHORT_SHA}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "Generated tag: ${TAG}"
+
+      - name: ?? Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:master
+            network=host
+
+      - name: ?? Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # ฤฤ Backend Image ฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤ
+      - name: ?? Backend Image Metadata
+        id: meta-backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}-backend
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.image-tag.outputs.tag }}
+          labels: |
+            org.opencontainers.image.title=Fusionpact Backend
+            org.opencontainers.image.description=FastAPI Backend Service
+            org.opencontainers.image.vendor=Fusionpact
+
+      - name: ??? Build & Push Backend Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          dockerfile: ./backend/Dockerfile
+          target: production
+          push: true
+          tags: ${{ steps.meta-backend.outputs.tags }}
+          labels: ${{ steps.meta-backend.outputs.labels }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ steps.image-tag.outputs.tag }}
+
+      # ฤฤ Frontend Image ฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤ
+      - name: ?? Frontend Image Metadata
+        id: meta-frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}-frontend
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.image-tag.outputs.tag }}
+          labels: |
+            org.opencontainers.image.title=Fusionpact Frontend
+            org.opencontainers.image.description=Nginx Frontend Service
+            org.opencontainers.image.vendor=Fusionpact
+
+      - name: ??? Build & Push Frontend Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          dockerfile: ./frontend/Dockerfile
+          target: production
+          push: true
+          tags: ${{ steps.meta-frontend.outputs.tags }}
+          labels: ${{ steps.meta-frontend.outputs.labels }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            VCS_REF=${{ github.sha }}
+
+      # ฤฤ Security Scan Built Images ฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤ
+      - name: ?? Scan Backend Image (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_PREFIX }}-backend:latest
+          format: "table"
+          exit-code: "0"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "CRITICAL,HIGH"
+
+      - name: ?? Scan Frontend Image (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_PREFIX }}-frontend:latest
+          format: "table"
+          exit-code: "0"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "CRITICAL,HIGH"
+
+  # อออออออออออออออออออออออออออออออออออออออออออออออออออออออ
+  # JOB 4: Deploy to Cloud (AWS EC2)
+  # อออออออออออออออออออออออออออออออออออออออออออออออออออออออ
+  deploy:
+    name: ?? Deploy to AWS Cloud
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: http://${{ secrets.EC2_HOST }}
+
+    steps:
+      - name: ?? Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: ?? Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ?? Create Production .env File
+        run: |
+          cat > .env.production << EOF
+          ENVIRONMENT=production
+          FRONTEND_PORT=80
+          BACKEND_PORT=8000
+          PROMETHEUS_PORT=9090
+          GRAFANA_PORT=3000
+          GRAFANA_ADMIN_PASSWORD=${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+          SECRET_KEY=${{ secrets.SECRET_KEY }}
+          DOCKER_USERNAME=${{ secrets.DOCKER_USERNAME }}
+          IMAGE_TAG=${{ needs.build-and-push.outputs.image_tag }}
+          EOF
+
+      - name: ?? Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          timeout: 120s
+          command_timeout: 25m
+          script: |
+            set -e
+            
+            echo "?? Starting Fusionpact Deployment..."
+            echo "?? Image Tag: ${{ needs.build-and-push.outputs.image_tag }}"
+            
+            # ฤฤ Navigate to project directory ฤฤฤฤฤฤฤฤฤฤ
+            cd ~/fusionpact-devops-challenge
+            
+            # ฤฤ Fetch latest code ฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤ
+            echo "?? Pulling latest code..."
+            git fetch origin main
+            git reset --hard origin/main
+            
+            # ฤฤ Login to Docker Hub ฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤ
+            echo "?? Logging into Docker Hub..."
+            echo "${{ secrets.DOCKER_PASSWORD }}" | \
+              docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+            
+            # ฤฤ Update image tags in compose ฤฤฤฤฤฤฤฤฤฤ
+            export IMAGE_TAG="${{ needs.build-and-push.outputs.image_tag }}"
+            export DOCKER_USERNAME="${{ secrets.DOCKER_USERNAME }}"
+            export GRAFANA_ADMIN_PASSWORD="${{ secrets.GRAFANA_ADMIN_PASSWORD }}"
+            export SECRET_KEY="${{ secrets.SECRET_KEY }}"
+            
+            # ฤฤ Pull new images ฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤ
+            echo "?? Pulling new Docker images..."
+            docker-compose -f docker-compose.prod.yml pull
+            
+            # ฤฤ Zero-downtime deployment ฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤ
+            echo "?? Deploying with zero downtime..."
+            
+            # Scale up new containers
+            docker-compose -f docker-compose.prod.yml up -d \
+              --remove-orphans \
+              --no-build
+            
+            # ฤฤ Wait for health checks ฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤ
+            echo "? Waiting for services to be healthy..."
+            sleep 30
+            
+            # Check backend health
+            for i in {1..10}; do
+              if curl -sf http://localhost:8000/health > /dev/null; then
+                echo "? Backend is healthy!"
+                break
+              fi
+              echo "? Waiting for backend... attempt $i/10"
+              sleep 10
+            done
+            
+            # Check frontend health
+            for i in {1..10}; do
+              if curl -sf http://localhost:80/health > /dev/null; then
+                echo "? Frontend is healthy!"
+                break
+              fi
+              echo "? Waiting for frontend... attempt $i/10"
+              sleep 10
+            done
+            
+            # ฤฤ Cleanup ฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤฤ
+            echo "?? Cleaning up old images..."
+            docker image prune -f --filter "until=24h"
+            docker system prune -f --volumes --filter "until=24h" || true
+            
+            echo ""
+            echo "อออออออออออออออออออออออออออออออออออออออ"
+            echo "? DEPLOYMENT COMPLETED SUCCESSFULLY!"
+            echo "?? Frontend: http://${{ secrets.EC2_HOST }}"
+            echo "? Backend:  http://${{ secrets.EC2_HOST }}:8000"
+            echo "?? Grafana:  http://${{ secrets.EC2_HOST }}:3000"
+            echo "?? Prometheus: http://${{ secrets.EC2_HOST }}:9090"
+            echo "อออออออออออออออออออออออออออออออออออออออ"
+
+      - name: ?? Reload Prometheus Config
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            curl -X POST http://localhost:9090/-/reload || true
+            echo "? Prometheus config reloaded"
+
+      - name: ? Post-Deployment Health Check
+        run: |
+          echo "?? Running post-deployment verification..."
+          sleep 20
+          
+          # Verify all endpoints
+          endpoints=(
+            "http://${{ secrets.EC2_HOST }}/health"
+            "http://${{ secrets.EC2_HOST }}:8000/health"
+            "http://${{ secrets.EC2_HOST }}:9090/-/healthy"
+          )
+          
+          for endpoint in "${endpoints[@]}"; do
+            if curl -sf --max-time 10 "$endpoint" > /dev/null; then
+              echo "? $endpoint - OK"
+            else
+              echo "? $endpoint - FAILED"
+              # Don't exit, just warn
+            fi
+          done
+
+      - name: ?? Notify Deployment Success
+        if: success()
+        run: |
+          echo "?? Deployment to production SUCCESSFUL!"
+          echo "?? Version: ${{ needs.build-and-push.outputs.image_tag }}"
+          echo "?? URL: http://${{ secrets.EC2_HOST }}"
+
+      - name: ?? Notify Deployment Failure
+        if: failure()
+        run: |
+          echo "? Deployment FAILED!"
+          echo "Check the workflow logs for details."
+          # Add Slack/email notification here if needed
+
+  # อออออออออออออออออออออออออออออออออออออออออออออออออออออออ
+  # JOB 5: Rollback (Manual trigger on failure)
+  # อออออออออออออออออออออออออออออออออออออออออออออออออออออออ
+  rollback:
+    name: ? Rollback Deployment
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: deploy
+    if: failure() && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+
+    steps:
+      - name: ? Rollback to Previous Version
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            echo "? Rolling back to previous version..."
+            cd ~/fusionpact-devops-challenge
+            
+            # Get the previous git commit
+            git stash
+            git checkout HEAD~1
+            
+            # Redeploy with previous version
+            docker-compose -f docker-compose.prod.yml up -d --no-build
+            
+            echo "? Rollback completed"

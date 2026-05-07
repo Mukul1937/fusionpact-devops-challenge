@@ -1,0 +1,104 @@
+﻿# ============================================================
+# Prometheus Configuration
+# Fusionpact DevOps Gauntlet - Monitoring Stack
+# ============================================================
+
+global:
+  scrape_interval: 15s          # Scrape every 15 seconds
+  evaluation_interval: 15s      # Evaluate rules every 15 seconds
+  scrape_timeout: 10s
+
+  # Labels added to all time series
+  external_labels:
+    cluster: "fusionpact-production"
+    environment: "production"
+    project: "fusionpact-devops-gauntlet"
+
+# �� Alerting Configuration ��������������������������������
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+      timeout: 10s
+      api_version: v2
+
+# �� Rule Files ��������������������������������������������
+rule_files:
+  - "/etc/prometheus/alert_rules.yml"
+
+# �� Scrape Configurations ���������������������������������
+scrape_configs:
+
+  # �� Prometheus Self-Monitoring ��������������������������
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels:
+          service: "prometheus"
+          component: "monitoring"
+    scrape_interval: 30s
+
+  # �� FastAPI Backend Application ��������������������������
+  - job_name: "fusionpact-backend"
+    static_configs:
+      - targets: ["backend:8000"]
+        labels:
+          service: "backend"
+          component: "api"
+          technology: "fastapi"
+          version: "1.0.0"
+    metrics_path: "/metrics"
+    scrape_interval: 15s
+    # Relabeling for better metric organization
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: "http_.*"
+        target_label: metric_type
+        replacement: "http_request"
+
+  # �� Node Exporter (Host/VM Metrics) ���������������������
+  - job_name: "node-exporter"
+    static_configs:
+      - targets: ["node-exporter:9100"]
+        labels:
+          service: "node-exporter"
+          component: "infrastructure"
+          host: "fusionpact-server"
+    scrape_interval: 15s
+
+  # �� cAdvisor (Container Metrics) ������������������������
+  - job_name: "cadvisor"
+    static_configs:
+      - targets: ["cadvisor:8080"]
+        labels:
+          service: "cadvisor"
+          component: "containers"
+    scrape_interval: 15s
+    metric_relabel_configs:
+      # Keep only relevant container metrics
+      - source_labels: [container_label_com_fusionpact_service]
+        regex: ".+"
+        action: keep
+      - source_labels: [__name__]
+        regex: "container_(cpu|memory|network|fs).*"
+        action: keep
+
+  # �� AlertManager �����������������������������������������
+  - job_name: "alertmanager"
+    static_configs:
+      - targets: ["alertmanager:9093"]
+        labels:
+          service: "alertmanager"
+          component: "monitoring"
+    scrape_interval: 30s
+
+  # �� Frontend (Nginx stub_status) �������������������������
+  - job_name: "nginx-frontend"
+    static_configs:
+      - targets: ["frontend:9113"]
+        labels:
+          service: "frontend"
+          component: "webserver"
+          technology: "nginx"
+    scrape_interval: 30s

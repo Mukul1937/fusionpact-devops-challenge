@@ -1,0 +1,60 @@
+﻿# ============================================================
+# AlertManager Configuration
+# ============================================================
+
+global:
+  smtp_smarthost: "smtp.gmail.com:587"
+  smtp_from: "alerts@fusionpact.io"
+  smtp_auth_username: "${SMTP_USER}"
+  smtp_auth_password: "${SMTP_PASSWORD}"
+  resolve_timeout: 5m
+
+# �� Routing �����������������������������������������������
+route:
+  group_by: ["alertname", "service", "severity"]
+  group_wait: 10s
+  group_interval: 10m
+  repeat_interval: 1h
+  receiver: "devops-team"
+
+  routes:
+    # Critical alerts go immediately
+    - match:
+        severity: critical
+      receiver: "critical-alerts"
+      group_wait: 0s
+      repeat_interval: 15m
+
+    # Warning alerts
+    - match:
+        severity: warning
+      receiver: "devops-team"
+      repeat_interval: 2h
+
+# �� Receivers ���������������������������������������������
+receivers:
+  - name: "devops-team"
+    email_configs:
+      - to: "devops@fusionpact.io"
+        subject: '[ALERT] {{ .GroupLabels.alertname }} - {{ .GroupLabels.severity }}'
+        html: |
+          <h2>Alert: {{ .GroupLabels.alertname }}</h2>
+          {{ range .Alerts }}
+          <p><b>Summary:</b> {{ .Annotations.summary }}</p>
+          <p><b>Description:</b> {{ .Annotations.description }}</p>
+          <p><b>Labels:</b> {{ .Labels }}</p>
+          {{ end }}
+
+  - name: "critical-alerts"
+    email_configs:
+      - to: "oncall@fusionpact.io"
+        subject: '?? CRITICAL ALERT: {{ .GroupLabels.alertname }}'
+        send_resolved: true
+
+# �� Inhibit Rules �����������������������������������������
+inhibit_rules:
+  - source_match:
+      severity: "critical"
+    target_match:
+      severity: "warning"
+    equal: ["alertname", "service"]
