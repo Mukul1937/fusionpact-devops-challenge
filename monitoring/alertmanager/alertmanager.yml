@@ -36,19 +36,19 @@ receivers:
   - name: "devops-team"
     email_configs:
       - to: "devops@fusionpact.io"
-        subject: '[ALERT] {{ .GroupLabels.alertname }} - {{ .GroupLabels.severity }}'
+        headers:
+          Subject: '[ALERT] {{ .GroupLabels.alertname }} - {{ .GroupLabels.severity }}'
         html: |
           <h2>Alert: {{ .GroupLabels.alertname }}</h2>
           {{ range .Alerts }}
           <p><b>Summary:</b> {{ .Annotations.summary }}</p>
-          <p><b>Description:</b> {{ .Annotations.description }}</p>
-          <p><b>Labels:</b> {{ .Labels }}</p>
           {{ end }}
 
   - name: "critical-alerts"
     email_configs:
       - to: "oncall@fusionpact.io"
-        subject: '?? CRITICAL ALERT: {{ .GroupLabels.alertname }}'
+        headers:
+          Subject: 'CRITICAL ALERT: {{ .GroupLabels.alertname }}'
         send_resolved: true
 
 # �� Inhibit Rules �����������������������������������������
